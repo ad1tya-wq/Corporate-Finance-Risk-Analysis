@@ -1,0 +1,15 @@
+mysql-connector-python
+pandas
+prophet
+matplotlib
+plotly
+faker
+langgraph
+langchain
+langchain-community
+langchain-groq
+streamlit
+time
+python-dotenv
+json
+docling

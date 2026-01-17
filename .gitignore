@@ -1,1 +1,5 @@
 .env
+__pycache__/
+static/metrics.json
+static/active_policy.txt
+static/forecast_plot.png

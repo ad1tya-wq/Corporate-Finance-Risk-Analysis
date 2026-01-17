@@ -1,5 +1,8 @@
+import json
 import pandas as pd
 from prophet import Prophet
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import mysql.connector
 import os
@@ -94,12 +97,26 @@ def run_forecast():
     plt.savefig(plot_path)
     print(f"Oracle: Forecast generated. Trend: {trend}")
     
-    return {
+    monthly_current = current_burn * 30 
+    monthly_predicted = predicted_burn * 30
+    
+    metrics = {
         "trend": trend,
-        "current_burn": round(float(current_burn), 2),
-        "predicted_burn": round(float(predicted_burn), 2),
-        "plot_path": plot_path
+        "current_burn": monthly_current,
+        "predicted_burn": monthly_predicted
     }
+    with open("static/metrics.json", "w") as f:
+        json.dump(metrics, f)
+        
+    return (
+        f"DATA REPORT:\n"
+        f"- Status: {trend}\n"
+        f"- Current Monthly Burn: ${monthly_current:,.2f}\n"
+        f"- Projected Monthly Burn (90 days): ${monthly_predicted:,.2f}\n"
+        f"- Visual Proof: {plot_path}\n\n"
+        f"SYSTEM ALERT: The projected burn exceeds the safe limit. "
+        f"Immediate cost-saving measures are required per company policy."
+    )
 
 # --- TEST BLOCK (Runs only if you execute this file directly) ---
 if __name__ == "__main__":

@@ -25,7 +25,13 @@ from datetime import datetime
 
 from dotenv import load_dotenv
 
-from eval.datasets import FORBIDDEN_MARKERS, INJECTION_CASES, RETRIEVAL_CASES, ROUTING_CASES
+from eval.datasets import (
+    FORBIDDEN_MARKERS,
+    INJECTION_CASES,
+    POLICY_QUERY_ADAPTIVITY_CASES,
+    RETRIEVAL_CASES,
+    ROUTING_CASES,
+)
 
 load_dotenv()
 
@@ -135,6 +141,11 @@ def eval_forecast_caching():
 
 
 def eval_injection_resistance():
+    """Live-model check. Note: temperature=0 does not guarantee bit-for-bit
+    determinism on Groq's hosted inference -- an occasional single-run flake
+    here (clean on immediate re-run with the identical payload) reflects
+    sampling variance, not a reproducible regression. Re-run before treating
+    a failure here as a real finding."""
     from agent import respond_node
     from langchain_core.messages import HumanMessage
 
@@ -212,27 +223,112 @@ def eval_groundedness():
     }
 
 
+def eval_policy_query_adaptivity():
+    """Live-model check (like eval_injection_resistance/eval_groundedness):
+    calls policy_agent_node directly with two different (question, forecast)
+    contexts and checks the chosen search query actually differs and leans
+    toward the expected domain -- proving the query is data-informed, not a
+    fixed/templated string like the old hardcoded POLICY_QUERY."""
+    from agent import policy_agent_node
+    from langchain_core.messages import HumanMessage
+
+    queries, per_case = [], []
+    for question, forecast_result, expected_keywords in POLICY_QUERY_ADAPTIVITY_CASES:
+        state = {
+            "messages": [HumanMessage(content=question)],
+            "forecast_result": forecast_result,
+            "policy_search_messages": [],
+        }
+        result = policy_agent_node(state)
+        ai_msg = result["policy_search_messages"][0]
+        query = (ai_msg.tool_calls[0]["args"]["query"] if ai_msg.tool_calls else "").lower()
+        queries.append(query)
+        matched = any(kw in query for kw in expected_keywords)
+        per_case.append({"question": question, "query": query, "domain_matched": matched})
+
+    queries_differ = len(queries) == len(set(queries)) and all(queries)
+    return {"queries_differ": queries_differ, "cases": per_case}
+
+
+def eval_policy_search_round_cap():
+    """should_continue_policy_search is pure code -- checked as a
+    deterministic function on hand-built scratchpads, same pattern as
+    eval_protocol_adherence, no LLM call."""
+    from agent import MAX_POLICY_TOOL_ROUNDS, should_continue_policy_search
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    def ai_with_call(i):
+        return AIMessage(
+            content="", tool_calls=[{"name": "read_policy_tool", "args": {"query": f"q{i}"}, "id": f"call_{i}"}]
+        )
+
+    def tool_result(i):
+        return ToolMessage(content="...", name="read_policy_tool", tool_call_id=f"call_{i}", artifact=[f"chunk_{i}"])
+
+    at_cap = []
+    for i in range(1, MAX_POLICY_TOOL_ROUNDS + 1):
+        at_cap += [ai_with_call(i), tool_result(i)]
+    at_cap.append(ai_with_call(MAX_POLICY_TOOL_ROUNDS + 1))  # one round over the cap
+
+    under_cap = [ai_with_call(1)]  # first round, well under cap
+    done_early = [AIMessage(content="Found what I need.", tool_calls=[])]  # model stops itself
+
+    scenarios = [
+        ({"policy_search_messages": at_cap}, "collect"),
+        ({"policy_search_messages": under_cap}, "search"),
+        ({"policy_search_messages": done_early}, "collect"),
+    ]
+    correct, per_case = 0, []
+    for state, expected in scenarios:
+        actual = should_continue_policy_search(state)
+        ok = actual == expected
+        correct += ok
+        per_case.append({"expected": expected, "actual": actual, "correct": ok})
+
+    return {"accuracy": round(correct / len(scenarios), 3), "cases": per_case}
+
+
+def eval_policy_agent_tool_scope():
+    """Deterministic, no LLM call: forecast_cashflow_tool (or anything else)
+    must never be bindable at the policy-search step. Confirms exactly one
+    tool schema is bound, and it's read_policy_tool -- a structural
+    guarantee, not a behavioral one, so it can't be fooled by prompting."""
+    from agent import policy_search_llm
+
+    bound_names = {t["function"]["name"] for t in policy_search_llm.kwargs.get("tools", [])}
+    return {"bound_tool_names": sorted(bound_names), "scope_correct": bound_names == {"read_policy_tool"}}
+
+
 def main():
     print("Running agentic RAG evaluation suite...\n")
     report = {"run_at": datetime.now().isoformat(), "results": {}}
 
-    print("[1/6] Retrieval quality (hit rate / MRR / rerank lift)...")
+    print("[1/9] Retrieval quality (hit rate / MRR / rerank lift)...")
     report["results"]["retrieval_quality"] = eval_retrieval_quality()
 
-    print("[2/6] Routing accuracy (intent gate)...")
+    print("[2/9] Routing accuracy (intent gate)...")
     report["results"]["routing_accuracy"] = eval_routing_accuracy()
 
-    print("[3/6] Protocol adherence (forecast -> policy graph edges)...")
+    print("[3/9] Protocol adherence (forecast -> policy graph edges)...")
     report["results"]["protocol_adherence"] = eval_protocol_adherence()
 
-    print("[4/6] Forecast caching efficiency...")
+    print("[4/9] Forecast caching efficiency...")
     report["results"]["forecast_caching"] = eval_forecast_caching()
 
-    print("[5/6] Prompt-injection resistance...")
+    print("[5/9] Prompt-injection resistance...")
     report["results"]["injection_resistance"] = eval_injection_resistance()
 
-    print("[6/6] Groundedness (answer numbers match retrieved data)...")
+    print("[6/9] Groundedness (answer numbers match retrieved data)...")
     report["results"]["groundedness"] = eval_groundedness()
+
+    print("[7/9] Policy search query adaptivity...")
+    report["results"]["policy_query_adaptivity"] = eval_policy_query_adaptivity()
+
+    print("[8/9] Policy search round-cap logic...")
+    report["results"]["policy_search_round_cap"] = eval_policy_search_round_cap()
+
+    print("[9/9] Policy agent tool scope...")
+    report["results"]["policy_agent_tool_scope"] = eval_policy_agent_tool_scope()
 
     os.makedirs("eval", exist_ok=True)
     with open(REPORT_PATH, "w", encoding="utf-8") as f:
@@ -256,6 +352,9 @@ def main():
         f"Groundedness current={r['groundedness']['current_burn_cited_correctly']}  "
         f"predicted={r['groundedness']['predicted_burn_cited_correctly']}"
     )
+    print(f"Adaptivity   queries_differ={r['policy_query_adaptivity']['queries_differ']}")
+    print(f"Round cap    accuracy={r['policy_search_round_cap']['accuracy']}")
+    print(f"Tool scope   correct={r['policy_agent_tool_scope']['scope_correct']}")
 
 
 if __name__ == "__main__":

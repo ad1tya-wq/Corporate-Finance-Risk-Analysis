@@ -1,131 +1,140 @@
-import json
+import os
+from datetime import timedelta
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import pandas as pd
 from prophet import Prophet
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import mysql.connector
-import os
-from dotenv import load_dotenv
 
-# Load env variables
-load_dotenv()
+from db import fetch_transactions_df, get_fresh_cached_forecast, get_max_transaction_date, log_forecast
 
-def get_db_connection():
-    return mysql.connector.connect(
-        host=os.getenv("DB_HOST", "localhost"),
-        user=os.getenv("DB_USER", "root"),
-        password=os.getenv("DB_PASSWORD", "password"),
-        database="financial_risk_db"
-    )
+CACHE_TTL = timedelta(hours=6)
+PLOT_PATH = os.path.join("static", "forecast_plot.png")
 
-def run_forecast():
+
+def _read_plot_bytes():
+    if os.path.exists(PLOT_PATH):
+        with open(PLOT_PATH, "rb") as f:
+            return f.read()
+    return None
+
+
+def run_forecast(force_refresh: bool = False) -> dict:
     """
-    1. Fetches transaction data.
-    2. Aggregates it by day.
-    3. Trains a Prophet model.
-    4. Predicts 90 days into the future.
-    5. Returns the forecast plot path and the textual summary.
+    Fetches transactions, trains Prophet, predicts 90 days out, and classifies
+    the trend. Refits only when the latest transaction date has moved past
+    what's cached in forecast_log, or the cache is older than CACHE_TTL —
+    a chat turn that doesn't need a fresh number reuses the last run instead
+    of pulling MySQL and refitting Prophet every time.
     """
+    max_txn_date = get_max_transaction_date()
+    if max_txn_date is None:
+        return {
+            "trend": "ERROR",
+            "current_burn": 0.0,
+            "predicted_burn": 0.0,
+            "plot_path": None,
+            "plot_bytes": None,
+            "from_cache": False,
+            "message": "No transaction data found.",
+        }
+
+    if not force_refresh:
+        cached = get_fresh_cached_forecast(max_txn_date, CACHE_TTL)
+        if cached:
+            return {
+                "trend": cached["trend"],
+                "current_burn": float(cached["current_burn"]),
+                "predicted_burn": float(cached["predicted_burn"]),
+                "plot_path": cached["plot_path"],
+                "plot_bytes": _read_plot_bytes(),
+                "from_cache": True,
+            }
+
     print("Oracle: Fetching financial data...")
-    
-    # 1. FETCH DATA
-    conn = get_db_connection()
-    # We use dictionary=True here so pandas can easily digest the rows
-    cursor = conn.cursor(dictionary=True) 
-    
-    query = """
-    SELECT date, SUM(amount) as total_spend 
-    FROM transactions 
-    GROUP BY date 
-    ORDER BY date ASC
-    """
-    cursor.execute(query)
-    result = cursor.fetchall()
-    
-    df = pd.DataFrame(result)
-    
-    cursor.close()
-    conn.close()
-
+    df = fetch_transactions_df()
     if df.empty:
-        return {"trend": "ERROR", "message": "No data found in database."}
+        return {
+            "trend": "ERROR",
+            "current_burn": 0.0,
+            "predicted_burn": 0.0,
+            "plot_path": None,
+            "plot_bytes": None,
+            "from_cache": False,
+            "message": "No data found in database.",
+        }
 
-    # 2. PREPARE DATA FOR PROPHET
-    # Prophet requires columns named strictly 'ds' (date) and 'y' (value)
-    df['ds'] = pd.to_datetime(df['date'])
-    df['y'] = df['total_spend']
-    
-    # Filter to keep only relevant columns
-    df = df[['ds', 'y']]
+    df["ds"] = pd.to_datetime(df["date"])
+    df["y"] = df["total_spend"]
+    df = df[["ds", "y"]]
 
     print(f"Oracle: Training model on {len(df)} days of data...")
-
-    # 3. TRAIN MODEL
-    # yearly_seasonality=True helps it understand annual budgets
-    # changepoint_prior_scale=0.5 makes it SENSITIVE to recent changes (like our crash)
-    m = Prophet(daily_seasonality=True, changepoint_prior_scale=0.5) 
+    # changepoint_prior_scale=0.5 makes it SENSITIVE to recent changes (like a crash)
+    m = Prophet(daily_seasonality=True, changepoint_prior_scale=0.5)
     m.fit(df)
 
-    # 4. PREDICT FUTURE (90 Days)
     future = m.make_future_dataframe(periods=90)
     forecast = m.predict(future)
 
-    # 5. ANALYZE RESULTS
-    # Get the average spending for next week vs last week to check trend
-    current_burn = df['y'].tail(30).mean() # Last 30 days actuals
-    predicted_burn = forecast['yhat'].tail(30).mean() # Next 30 days prediction
-    
+    current_burn = df["y"].tail(30).mean()
+    predicted_burn = forecast["yhat"].tail(30).mean()
+
     trend = "STABLE"
     if predicted_burn > current_burn * 1.5:
         trend = "CRITICAL SPIKE"
     elif predicted_burn > current_burn * 1.1:
         trend = "INCREASING (RISK)"
 
-    # 6. SAVE PLOT (For the UI)
+    os.makedirs("static", exist_ok=True)
     plt.figure(figsize=(10, 6))
     m.plot(forecast, ax=plt.gca())
     plt.title("Financial Burn Rate Forecast (Next 90 Days)")
     plt.xlabel("Date")
     plt.ylabel("Daily Spend ($)")
-    
-    # Save to a static folder so the UI can read it later
-    if not os.path.exists("static"):
-        os.makedirs("static")
-    
-    plot_path = "static/forecast_plot.png"
-    plt.savefig(plot_path)
+    plt.savefig(PLOT_PATH)
+    plt.close()
     print(f"Oracle: Forecast generated. Trend: {trend}")
-    
-    monthly_current = current_burn * 30 
+
+    monthly_current = current_burn * 30
     monthly_predicted = predicted_burn * 30
-    
-    metrics = {
+
+    log_forecast(max_txn_date, trend, monthly_current, monthly_predicted, PLOT_PATH)
+
+    return {
         "trend": trend,
         "current_burn": monthly_current,
-        "predicted_burn": monthly_predicted
+        "predicted_burn": monthly_predicted,
+        "plot_path": PLOT_PATH,
+        "plot_bytes": _read_plot_bytes(),
+        "from_cache": False,
     }
-    with open("static/metrics.json", "w") as f:
-        json.dump(metrics, f)
-        
-    return (
-        f"DATA REPORT:\n"
-        f"- Status: {trend}\n"
-        f"- Current Monthly Burn: ${monthly_current:,.2f}\n"
-        f"- Projected Monthly Burn (90 days): ${monthly_predicted:,.2f}\n"
-        f"- Visual Proof: {plot_path}\n\n"
-        f"SYSTEM ALERT: The projected burn exceeds the safe limit. "
-        f"Immediate cost-saving measures are required per company policy."
-    )
 
-# --- TEST BLOCK (Runs only if you execute this file directly) ---
+
+def format_forecast_report(result: dict) -> str:
+    if result["trend"] == "ERROR":
+        return f"DATA REPORT: {result.get('message', 'Forecast unavailable.')}"
+
+    lines = [
+        "DATA REPORT:",
+        f"- Status: {result['trend']}",
+        f"- Current Monthly Burn: ${result['current_burn']:,.2f}",
+        f"- Projected Monthly Burn (90 days): ${result['predicted_burn']:,.2f}",
+    ]
+    if result["trend"] != "STABLE":
+        lines.append("")
+        lines.append(
+            "SYSTEM ALERT: The projected burn exceeds the safe limit. "
+            "Immediate cost-saving measures are required per company policy."
+        )
+    return "\n".join(lines)
+
+
 if __name__ == "__main__":
     try:
         result = run_forecast()
         print("\n--- FORECAST REPORT ---")
-        print(f"Trend: {result['trend']}")
-        print(f"Current Monthly Burn (approx): ${result['current_burn'] * 30:,.2f}")
-        print(f"Projected Monthly Burn: ${result['predicted_burn'] * 30:,.2f}")
-        print(f"Check the plot at: {result['plot_path']}")
+        print(format_forecast_report(result))
     except Exception as e:
         print(f"Error running forecast: {e}")

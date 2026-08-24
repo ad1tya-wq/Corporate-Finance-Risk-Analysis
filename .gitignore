@@ -4,3 +4,4 @@ static/metrics.json
 static/active_policy.txt
 static/forecast_plot.png
 data/vectorstore/
+eval/report.json

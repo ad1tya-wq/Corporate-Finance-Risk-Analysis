@@ -54,3 +54,39 @@ def retrieve_policy(query: str, top_k: int = TOP_K_RETRIEVE, top_n: int = TOP_N_
     scores = _reranker().predict(pairs)
     ranked = sorted(zip(candidates, scores), key=lambda pair: pair[1], reverse=True)
     return [doc for doc, _ in ranked[:top_n]]
+
+
+def retrieve_policy_debug(query: str, top_k: int = TOP_K_RETRIEVE, top_n: int = TOP_N_RERANKED) -> list[dict]:
+    """
+    Like retrieve_policy, but returns per-chunk detail (source document,
+    pre-rerank vector rank, post-rerank rank, rerank score) instead of just
+    text. Used by eval/ to measure retrieval quality, not by the live agent.
+    """
+    collection = _collection()
+    query_embedding = _embedder().encode([query]).tolist()
+    results = collection.query(query_embeddings=query_embedding, n_results=top_k)
+    documents = results.get("documents", [[]])[0]
+    metadatas = results.get("metadatas", [[]])[0]
+    if not documents:
+        return []
+
+    pairs = [(query, doc) for doc in documents]
+    scores = _reranker().predict(pairs)
+
+    pre_rank = {i: i for i in range(len(documents))}
+    post_order = sorted(range(len(documents)), key=lambda i: scores[i], reverse=True)
+    post_rank = {i: rank for rank, i in enumerate(post_order)}
+
+    debug = []
+    for i, (doc, meta) in enumerate(zip(documents, metadatas)):
+        debug.append(
+            {
+                "text": doc,
+                "source": meta.get("source"),
+                "pre_rerank_rank": pre_rank[i],
+                "post_rerank_rank": post_rank[i],
+                "rerank_score": float(scores[i]),
+                "in_top_n": post_rank[i] < top_n,
+            }
+        )
+    return sorted(debug, key=lambda d: d["post_rerank_rank"])

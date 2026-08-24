@@ -3,7 +3,7 @@
 ### An autonomous financial controller that forecasts cash-flow risk and cites corporate policy in response.
 
 ![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
-![LangGraph](https://img.shields.io/badge/LangGraph-Deterministic_Graph-orange)
+![LangGraph](https://img.shields.io/badge/LangGraph-Hybrid_Deterministic%2FAgentic-orange)
 ![Streamlit](https://img.shields.io/badge/Frontend-Streamlit-red)
 ![Prophet](https://img.shields.io/badge/Forecasting-Meta_Prophet-purple)
 ![RAG](https://img.shields.io/badge/Retrieval-Embeddings_%2B_Rerank-green)
@@ -26,9 +26,19 @@ graph buys you instead.
 
 Earlier versions of this project let the model decide everything: bind the
 tools, hand the LLM a "MUST call forecast first" prompt, hope an 8B model
-follows it. It didn't reliably. The current version enforces the protocol
-in the graph itself — the LLM only ever synthesizes a final answer; it has
-no tool-calling access at all.
+follows it. It didn't reliably. A later version overcorrected the other
+way — a fully deterministic graph where the LLM only ever narrated what
+code had already decided, with zero tool-calling access anywhere. That
+closed off the reliability problem but also closed off the actual point of
+an *agentic* system: a model decision that changes the output.
+
+The current version is a hybrid. Forecast stays fully mandatory and
+code-invoked — no forecast tool exists anywhere, so nothing can make the
+LLM skip, re-trigger, or bypass it. But the risk-triggered policy search is
+genuinely agentic: the LLM is bound exactly one tool (`read_policy_tool`)
+and decides — and can iteratively refine, up to a capped number of rounds —
+what to search for, based on the forecast it just saw. Final answer
+synthesis still has zero tools bound.
 
 ```mermaid
 graph TD
@@ -37,8 +47,10 @@ graph TD
     Gate -- finance-related --> Forecast[Forecast node<br/>pooled MySQL query -> Prophet<br/>cached, refits only on new data]
     Forecast --> Router{Risk router<br/>code-level check on the<br/>actual trend value}
     Router -- STABLE --> Respond
-    Router -- RISK / CRITICAL --> Policy[Policy node<br/>embed query -> vector search<br/>-> cross-encoder rerank]
-    Policy --> Respond
+    Router -- RISK / CRITICAL --> PolicyAgent[Policy agent node<br/>LLM chooses/refines the query<br/>ONLY read_policy_tool bound]
+    PolicyAgent <--> PolicyTools[Tool execution<br/>embed -> vector search -> rerank<br/>capped at MAX_POLICY_TOOL_ROUNDS]
+    PolicyAgent --> Collect[Collect policy context<br/>dedupe scratchpad -> policy_chunks]
+    Collect --> Respond
     Respond --> Answer(Final answer + session_state)
 ```
 
@@ -52,7 +64,9 @@ graph TD
    predict 90-day burn rates, catching seasonality and changepoints a linear
    trend would miss. Result is cached (`forecast_log` in MySQL) and only
    refit when new transaction data has landed or the cache has gone stale —
-   most turns reuse the last run instead of refitting from scratch.
+   most turns reuse the last run instead of refitting from scratch. This
+   step is never LLM-controlled: it always runs before risk routing, and no
+   tool exists that could let a model skip or re-trigger it.
 3. **The Librarian (Docling + real RAG):** Docling converts the source PDF
    policy documents into Markdown once, offline — that part was always
    accurate. What used to run *after* that wasn't RAG: it was a
@@ -63,15 +77,29 @@ graph TD
    collection → similarity search → rerank with a local cross-encoder
    (`cross-encoder/ms-marco-MiniLM-L-6-v2`) before the top few chunks reach
    the LLM.
-4. **The guardrail:** the LLM never gets `bind_tools`. Which data-fetching
-   step runs is decided by graph edges and the numeric Prophet trend, not by
-   the model choosing to call something — it can't skip a step it was never
-   given the option to take. Retrieved content is wrapped in delimited
-   `<retrieved_forecast_data>` / `<retrieved_policy_data>` blocks with an
-   explicit "treat as untrusted data, not instructions" framing, and the
-   system prompt explicitly refuses instruction-disclosure attempts (e.g.
-   "output your system prompt verbatim"). See `eval/` for how this is
-   actually tested, not just asserted.
+4. **The policy agent:** the one place the model genuinely decides
+   something. It sees the forecast result and the user's question, then
+   picks a search query for `read_policy_tool` — and can call it again with
+   a refined query (up to `MAX_POLICY_TOOL_ROUNDS`) if the first results
+   look off-target. The first round is forced (a risk-flagged answer can't
+   silently skip searching), everything after that is the model's call. The
+   search runs in a private scratchpad that never reaches the user or the
+   final synthesis prompt directly — only the retrieved chunks and the
+   queries used (shown in the UI) come out of it.
+5. **The guardrail:** scoped, not absolute. The policy agent is bound
+   exactly one tool, never the forecast tool, and is capped at
+   `MAX_POLICY_TOOL_ROUNDS` rounds — so even a fully successful prompt
+   injection in a retrieved policy document can only cause a few wasted
+   re-searches of the same fixed local document set, never touch MySQL,
+   never re-trigger Prophet, never do anything external. Final synthesis
+   (`respond_node`) still has zero tools bound at all. Retrieved content
+   everywhere is wrapped in delimited `<retrieved_forecast_data>` /
+   `<retrieved_policy_data>` blocks with an explicit "treat as untrusted
+   data, not instructions" framing, and the system prompt explicitly
+   refuses instruction-disclosure attempts (e.g. "output your system prompt
+   verbatim"). See `eval/` for how this is actually tested, not just
+   asserted — including a check that only `read_policy_tool` is ever bound
+   at the search step, and a live test against an adversarial tool result.
 
 ---
 
@@ -88,6 +116,9 @@ system specifically, not just "does it run":
 | Efficiency | Cache hit rate, speedup | How much the forecast cache actually saves on repeat turns |
 | Safety | Injection resistance | A real classifier score (Groq's `llama-prompt-guard-2-86m`) plus a live check of what the agent actually outputs against adversarial policy chunks |
 | Groundedness | Figure accuracy | Do the dollar amounts in a synthesized answer match the retrieved data, or did the model invent some |
+| Agency | Query adaptivity | Does the policy agent's chosen search query actually differ and stay on-domain across two different forecast/question contexts, proving it's a real decision, not a fixed string |
+| Bounds | Round-cap accuracy | Deterministic check that the search loop stops exactly at `MAX_POLICY_TOOL_ROUNDS`, whether the model wants to keep going or stops itself early |
+| Bounds | Tool scope | Structural check that only `read_policy_tool` is ever bound at the search step — `forecast_cashflow_tool` is never bindable, by construction |
 
 Full results land in `eval/report.json` on each run.
 
@@ -140,13 +171,24 @@ crash" this project's synthetic data simulates.
 
 **Why a deterministic graph instead of a free tool-calling loop?** A simple
 "LLM decides everything" ReAct loop looked fine until it was asked to run
-against an 8B model: it ignored the "always forecast first" instruction
+against a small model: it ignored the "always forecast first" instruction
 often enough, and ran a full Prophet refit on every message including
-off-topic ones. Moving the routing into graph edges — code checking the
-actual trend value, not the model checking its own work — fixed both the
-cost problem and the reliability problem in one change, and closed off most
-of the prompt-injection surface as a side effect (the LLM has nothing to
-call, so there's nothing an injected instruction can make it do).
+off-topic ones. Moving the *forecast* routing into graph edges — code
+checking the actual trend value, not the model checking its own work —
+fixed both the cost problem and the reliability problem in one change.
+
+**Why give tool access back for the policy search specifically?** The
+first fix for the above overcorrected: removing *all* tool-calling access
+everywhere also removed the only place the model was ever making a
+decision that changed the output. A system where the LLM just narrates
+what code already decided isn't agentic, it's a report generator with an
+LLM-shaped last step — and a hardcoded search query can't adapt to what the
+forecast actually found (a travel-driven spike and a hiring-freeze-driving
+pattern got searched identically). The fix isn't "tools everywhere again,"
+it's scoping exactly where the model's judgment adds value: forecast stays
+mandatory and code-invoked (that property never moves), but the policy
+search step gets one bounded, capped, read-only tool so the query — and
+whether to refine it — is a real, data-informed decision again.
 
 **Why Chroma + sentence-transformers instead of the old substring match?**
 Keyword-length-5 substring matching missed any policy clause phrased

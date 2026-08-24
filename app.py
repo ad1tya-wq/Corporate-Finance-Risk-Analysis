@@ -45,12 +45,14 @@ if "forecast_result" not in st.session_state:
     st.session_state.forecast_result = None
 if "policy_chunks" not in st.session_state:
     st.session_state.policy_chunks = None
+if "policy_search_queries" not in st.session_state:
+    st.session_state.policy_search_queries = None
 
 # --- SIDEBAR (CONTROLS) ---
 with st.sidebar:
     st.image("https://cdn-icons-png.flaticon.com/512/9322/9322127.png", width=50)
     st.title("Sentinel Protocol")
-    st.caption("v1.1.0 | Connected to MySQL")
+    st.caption("v1.2.0 | Connected to MySQL")
     st.markdown("---")
 
     if st.button("🔄 Reset System Memory"):
@@ -59,6 +61,7 @@ with st.sidebar:
         st.session_state.messages = []
         st.session_state.forecast_result = None
         st.session_state.policy_chunks = None
+        st.session_state.policy_search_queries = None
         st.rerun()
 
 # --- TOP BANNER (LIVE METRICS) ---
@@ -100,6 +103,9 @@ with col_evidence:
     is_risk = bool(metrics) and ("RISK" in metrics.get("trend", "") or "CRITICAL" in metrics.get("trend", ""))
 
     if is_risk:
+        if st.session_state.policy_search_queries:
+            queries = ", ".join(f'"{q}"' for q in st.session_state.policy_search_queries)
+            st.caption(f"🔍 Sentinel searched for: {queries}")
         if st.session_state.policy_chunks:
             policy_content = "\n\n---\n\n".join(st.session_state.policy_chunks)
             st.warning(f"⚠️ PROTOCOL ACTIVATED:\n\n{policy_content}")
@@ -131,6 +137,8 @@ with col_chat:
                         st.session_state.forecast_result = result["forecast_result"]
                     if result.get("policy_chunks"):
                         st.session_state.policy_chunks = result["policy_chunks"]
+                    if result.get("policy_search_queries"):
+                        st.session_state.policy_search_queries = result["policy_search_queries"]
 
                     st.write(bot_response)
                     st.session_state.messages.append({"role": "assistant", "content": bot_response})
